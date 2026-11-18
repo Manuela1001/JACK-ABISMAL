@@ -1,0 +1,499 @@
+// JACK ABISMAL
+
+class Main {
+
+    field Array cosTable, sinTable;   // tabla de 24 posiciones (pasos de 15 grados), escalada x100
+    field int numSteps;               // 24 posiciones posibles en el círculo
+
+    field int centerX, centerY;       // núcleo del vórtice
+    field int orbitRadius;            // radio fijo de la órbita del jugador
+    field int angle;                  // posición angular actual del jugador (0..23)
+
+    // --- Escombros arrastrados por la corriente ---
+    field int NUM_OBJ;
+    field Array objAngle, objRadius, objActive, objSpeed;
+    field int outerRadius, speed, maxSpeed, spawnEvery, minSpawnEvery, frameCount, nextSlot;
+
+    // --- Generador pseudo-aleatorio (LCG), semilla sembrada por tiempo de reacción del jugador ---
+    field int seed;
+
+    // --- Fondo: anillos de corriente, dibujados SOLO como contorno (polígono de 12 lados) ---
+    field int NUM_RINGS;
+    field Array ringRadius;
+    field int ringMax, ringMin, ringSpeed;
+
+    // --- Partículas: aparecen quietas, esperan un tiempo al azar y luego caen ---
+    field int NUM_PARTICLES;
+    field Array particleAngle, particleRadius, particleActive, particleSpeed, particleTimer;
+    field int particleNextSlot, particleSpawnChance, particleMinR, particleRange;
+
+    field int score, alive, key, prevDigits;
+
+    constructor Main new() {
+        let numSteps = 24;
+        let centerX = 256;
+        let centerY = 128;
+        let orbitRadius = 80;
+        let angle = 0;
+
+        let NUM_OBJ = 6;
+        let outerRadius = 120;
+        let speed = 2;
+        let maxSpeed = 6;
+        let spawnEvery = 40;
+        let minSpawnEvery = 16;
+        let frameCount = 0;
+        let nextSlot = 0;
+
+        let seed = 17; // se re-siembra de verdad en seedFromWait(), antes de jugar
+
+        let NUM_RINGS = 6;
+        let ringMax = 125;
+        let ringMin = 5;
+        let ringSpeed = 1;
+
+        let NUM_PARTICLES = 3;
+        let particleNextSlot = 0;
+        let particleSpawnChance = 90; // 1 en 90 por frame, en promedio cada ~4.5 segundos
+        let particleMinR = orbitRadius + 15;
+        let particleRange = outerRadius - particleMinR;
+
+        let score = 0;
+        let alive = 1;
+        let prevDigits = 1;
+
+        do initTables();
+        do initRings();
+
+        let objAngle = Array.new(NUM_OBJ);
+        let objRadius = Array.new(NUM_OBJ);
+        let objActive = Array.new(NUM_OBJ);
+        let objSpeed = Array.new(NUM_OBJ);
+        let key = 0;
+
+        let particleAngle = Array.new(NUM_PARTICLES);
+        let particleRadius = Array.new(NUM_PARTICLES);
+        let particleActive = Array.new(NUM_PARTICLES);
+        let particleSpeed = Array.new(NUM_PARTICLES);
+        let particleTimer = Array.new(NUM_PARTICLES);
+        do initParticles();
+
+        return this;
+    }
+
+    // Deja todas las partículas inactivas al empezar (el heap no se garantiza en cero).
+    method void initParticles() {
+        var int i;
+        let i = 0;
+        while (i < NUM_PARTICLES) {
+            let particleActive[i] = 0;
+            let i = i + 1;
+        }
+        return;
+    }
+
+    // Carga las tablas de seno/coseno precalculadas (x100), cada 15 grados.
+    method void initTables() {
+        let cosTable = Array.new(24);
+        let sinTable = Array.new(24);
+
+        let cosTable[0]=100; let cosTable[1]=97;  let cosTable[2]=87;  let cosTable[3]=71;
+        let cosTable[4]=50;  let cosTable[5]=26;  let cosTable[6]=0;   let cosTable[7]=-26;
+        let cosTable[8]=-50; let cosTable[9]=-71; let cosTable[10]=-87;let cosTable[11]=-97;
+        let cosTable[12]=-100;let cosTable[13]=-97;let cosTable[14]=-87;let cosTable[15]=-71;
+        let cosTable[16]=-50;let cosTable[17]=-26;let cosTable[18]=0;  let cosTable[19]=26;
+        let cosTable[20]=50; let cosTable[21]=71; let cosTable[22]=87; let cosTable[23]=97;
+
+        let sinTable[0]=0;   let sinTable[1]=26;  let sinTable[2]=50;  let sinTable[3]=71;
+        let sinTable[4]=87;  let sinTable[5]=97;  let sinTable[6]=100; let sinTable[7]=97;
+        let sinTable[8]=87;  let sinTable[9]=71;  let sinTable[10]=50; let sinTable[11]=26;
+        let sinTable[12]=0;  let sinTable[13]=-26;let sinTable[14]=-50;let sinTable[15]=-71;
+        let sinTable[16]=-87;let sinTable[17]=-97;let sinTable[18]=-100;let sinTable[19]=-97;
+        let sinTable[20]=-87;let sinTable[21]=-71;let sinTable[22]=-50;let sinTable[23]=-26;
+
+        return;
+    }
+
+    // Seis anillos repartidos uniformemente, para que siempre haya varios visibles
+    // en distintas etapas de la succión — así el "reinicio" de cada uno pasa inadvertido.
+    method void initRings() {
+        var int i, gap;
+        let ringRadius = Array.new(NUM_RINGS);
+        let gap = Math.divide(ringMax, NUM_RINGS);
+        let i = 0;
+        while (i < NUM_RINGS) {
+            let ringRadius[i] = ringMax - Math.multiply(i, gap);
+            let i = i + 1;
+        }
+        return;
+    }
+
+    // x = centro + radio * cos(angulo) / 100  (idem para y con seno).
+    // Se protege el resultado para que NUNCA quede fuera de la pantalla
+    // (0..511 en x, 0..255 en y), sin importar qué devuelva Math.divide.
+    method int calcX(int a, int r) {
+        var int x;
+        let x = centerX + (Math.divide(Math.multiply(r, cosTable[a]), 100));
+        if (x < 0) { let x = 0; }
+        if (x > 511) { let x = 511; }
+        return x;
+    }
+
+    method int calcY(int a, int r) {
+        var int y;
+        let y = centerY + (Math.divide(Math.multiply(r, sinTable[a]), 100));
+        if (y < 0) { let y = 0; }
+        if (y > 255) { let y = 255; }
+        return y;
+    }
+
+    // Residuo entero (a mod b).
+    // Siempre devuelve un valor entre 0 y b-1, incluso si 'a' es negativo.
+    method int modulo(int a, int b) {
+        var int r;
+        let r = a - (Math.multiply(Math.divide(a, b), b));
+        if (r < 0) { let r = r + b; }
+        return r;
+    }
+
+    // Dibuja un círculo asegurando que NUNCA se salga de la pantalla
+    // (el OS lanza error si el círculo toca fuera de 0..511 / 0..255).
+    method void safeCircle(int x, int y, int r) {
+        if (x < r) { let x = r; }
+        if (x > (511 - r)) { let x = 511 - r; }
+        if (y < r) { let y = r; }
+        if (y > (255 - r)) { let y = 255 - r; }
+        do Screen.drawCircle(x, y, r);
+        return;
+    }
+
+    // Antes de empezar, cuenta cuántos ciclos pasan hasta que el jugador presiona una tecla.
+    // Ese conteo depende del tiempo de reacción humano (nunca es igual dos veces),
+    // así que sirve como semilla real de aleatoriedad entre partidas.
+    method void seedFromWait() {
+        var int counter;
+        let counter = 0;
+        while (Keyboard.keyPressed() = 0) {
+            let counter = counter + 1;
+            if (counter > 30000) { let counter = 0; } // evita desbordar a negativo
+        }
+        let seed = modulo(counter, 251);
+        if (seed = 0) { let seed = 1; }
+        do Sys.wait(300); // deja soltar la tecla antes de iniciar el juego
+        return;
+    }
+
+    // Generador congruencial lineal: la semilla evoluciona en cada llamada.
+    // Ahora solo se usa para variar la VELOCIDAD de cada escombro, no su posición.
+    method int nextRandom(int range) {
+        let seed = modulo((Math.multiply(seed, 13) + 7), 251);
+        return modulo(seed, range);
+    }
+
+    // El escombro nace apuntando a donde está el jugador EN ESTE INSTANTE,
+    // no a un ángulo al azar. Para que no sea trivial, cada uno cae a una
+    // velocidad distinta (variación de 0 a 2 sobre la velocidad base).
+    method void spawnObject() {
+        var int i;
+        let i = nextSlot;
+        if (objActive[i] = 0) {
+            let objAngle[i] = angle;
+            let objRadius[i] = outerRadius;
+            let objActive[i] = 1;
+            let objSpeed[i] = speed + nextRandom(3);
+        }
+        let nextSlot = nextSlot + 1;
+        if (nextSlot = NUM_OBJ) { let nextSlot = 0; }
+        return;
+    }
+
+    method void drawParticleAt(int a, int r, boolean color) {
+        var int x, y;
+        let x = calcX(a, r);
+        let y = calcY(a, r);
+        do Screen.setColor(color);
+        do safeCircle(x, y, 3);
+        return;
+    }
+
+    // Aparece en un punto fijo al azar (entre la órbita y el borde) y se queda quieta
+    // esperando un número de frames también al azar (entre ~1 y ~8.5 segundos).
+    method void spawnParticle() {
+        var int i, r;
+        let i = particleNextSlot;
+        if (particleActive[i] = 0) {
+            let particleAngle[i] = nextRandom(numSteps);
+            let r = particleMinR + nextRandom(particleRange);
+            let particleRadius[i] = r;
+            let particleActive[i] = 1; // esperando, quieta
+            let particleTimer[i] = 20 + nextRandom(150);
+            do drawParticleAt(particleAngle[i], r, true);
+        }
+        let particleNextSlot = particleNextSlot + 1;
+        if (particleNextSlot = NUM_PARTICLES) { let particleNextSlot = 0; }
+        return;
+    }
+
+    // Mientras espera, no se mueve ni se vuelve a dibujar (ya está en pantalla).
+    // Al llegar a cero el temporizador, arranca a caer con velocidad al azar (1 a 5).
+    method void updateParticles() {
+        var int i, diff;
+        let i = 0;
+        while (i < NUM_PARTICLES) {
+            if (particleActive[i] = 1) {
+                let particleTimer[i] = particleTimer[i] - 1;
+                if (particleTimer[i] < 1) {
+                    let particleActive[i] = 2;
+                    let particleSpeed[i] = 1 + nextRandom(5);
+                }
+            } else {
+                if (particleActive[i] = 2) {
+                    do drawParticleAt(particleAngle[i], particleRadius[i], false);
+                    let particleRadius[i] = particleRadius[i] - particleSpeed[i];
+
+                    let diff = particleAngle[i] - angle;
+                    if (diff < 0) { let diff = -diff; }
+                    if (diff > (numSteps / 2)) { let diff = numSteps - diff; } // distancia circular (23 y 0 son vecinos)
+
+                    if (((particleRadius[i] < (orbitRadius + 4)) & (particleRadius[i] > (orbitRadius - 4)))) {
+                        if (diff < 2) {
+                            let alive = 0; // colisión: fin del juego
+                        } else {
+                            let score = score + 1;
+                            let particleActive[i] = 0;
+                        }
+                    }
+
+                    if (particleRadius[i] < 1) {
+                        let particleActive[i] = 0;
+                    }
+
+                    if (particleActive[i] = 2) {
+                        do drawParticleAt(particleAngle[i], particleRadius[i], true);
+                    }
+                }
+            }
+            let i = i + 1;
+        }
+        return;
+    }
+
+    method void drawPlanetAt(int a, boolean color) {
+        var int x, y;
+        let x = calcX(a, orbitRadius);
+        let y = calcY(a, orbitRadius);
+        do Screen.setColor(color);
+        do safeCircle(x, y, 5);
+        return;
+    }
+
+    method void drawCenter() {
+        do Screen.setColor(true);
+        do Screen.drawCircle(centerX, centerY, 6);
+        return;
+    }
+
+    // Dibuja SOLO el contorno de un anillo, como un polígono de 8 lados
+    // (usa la tabla de 24 posiciones saltando de a 3, para aliviar el cálculo
+    // ahora que hay más anillos en pantalla).
+    method void drawRingOutline(int r, boolean color) {
+        var int i, next, x1, y1, x2, y2;
+        let i = 0;
+        do Screen.setColor(color);
+        while (i < numSteps) {
+            let next = i + 3;
+            if (next > (numSteps - 1)) { let next = 0; }
+            let x1 = calcX(i, r);
+            let y1 = calcY(i, r);
+            let x2 = calcX(next, r);
+            let y2 = calcY(next, r);
+            if (~((x1 = x2) & (y1 = y2))) {
+                do Screen.drawLine(x1, y1, x2, y2);
+            }
+            let i = i + 3;
+        }
+        return;
+    }
+
+    // Cada anillo se contrae hacia el núcleo; al llegar al mínimo, reaparece en el máximo.
+    method void updateRings() {
+        var int i;
+        let i = 0;
+        while (i < NUM_RINGS) {
+            do drawRingOutline(ringRadius[i], false); // borra el contorno anterior
+
+            let ringRadius[i] = ringRadius[i] - ringSpeed;
+            if (ringRadius[i] < ringMin) {
+                let ringRadius[i] = ringMax;
+            }
+
+            do drawRingOutline(ringRadius[i], true); // dibuja el contorno nuevo
+            let i = i + 1;
+        }
+        return;
+    }
+
+    method void updateObjects() {
+        var int i, x, y, diff;
+        let i = 0;
+        while (i < NUM_OBJ) {
+            if (objActive[i] = 1) {
+                let x = calcX(objAngle[i], objRadius[i]);
+                let y = calcY(objAngle[i], objRadius[i]);
+                do Screen.setColor(false);
+                do safeCircle(x, y, 3);
+
+                let objRadius[i] = objRadius[i] - objSpeed[i];
+
+                let diff = objAngle[i] - angle;
+                if (diff < 0) { let diff = -diff; }
+                if (diff > (numSteps / 2)) { let diff = numSteps - diff; } // distancia circular (23 y 0 son vecinos)
+
+                if (((objRadius[i] < (orbitRadius + 4)) & (objRadius[i] > (orbitRadius - 4)))) {
+                    if (diff < 2) {
+                        let alive = 0; // colisión: fin del juego
+                    } else {
+                        let score = score + 1;
+                        let objActive[i] = 0;
+                    }
+                }
+
+                if (objRadius[i] < 1) {
+                    let objActive[i] = 0;
+                }
+
+                if (objActive[i] = 1) {
+                    let x = calcX(objAngle[i], objRadius[i]);
+                    let y = calcY(objAngle[i], objRadius[i]);
+                    do Screen.setColor(true);
+                    do safeCircle(x, y, 3);
+                }
+            }
+            let i = i + 1;
+        }
+        return;
+    }
+
+    // Cuenta cuántos dígitos tiene un número (para saber cuánto "borrar" con backSpace).
+    method int countDigits(int n) {
+        if (n < 10) { return 1; }
+        if (n < 100) { return 2; }
+        if (n < 1000) { return 3; }
+        if (n < 10000) { return 4; }
+        return 5;
+    }
+
+    method void drawScoreLabel() {
+        do Output.printString("Puntaje: ");
+        return;
+    }
+
+    // Borra el número anterior con backSpace (no depende de moveTo) y escribe el nuevo.
+    method void drawScore() {
+        var int i;
+        let i = 0;
+        while (i < prevDigits) {
+            do Output.backSpace();
+            let i = i + 1;
+        }
+        do Output.printInt(score);
+        let prevDigits = countDigits(score);
+        return;
+    }
+
+    // Baja el cursor hasta la mitad vertical de la pantalla y escribe "GAME OVER"
+    // centrado horizontalmente, sin tocar el marcador (que queda donde estaba).
+    method void showGameOver() {
+        var int i;
+        let i = 0;
+        while (i < 10) {
+            do Output.println();
+            let i = i + 1;
+        }
+        do Output.printString("                           GAME OVER");
+        return;
+    }
+
+    // Cada cierto número de frames, sube la velocidad de caída y/o la frecuencia de aparición.
+    method void increaseDifficulty() {
+        if (modulo(frameCount, 150) = 0) {
+            if (speed < maxSpeed) {
+                let speed = speed + 1;
+            }
+            if (spawnEvery > minSpawnEvery) {
+                let spawnEvery = spawnEvery - 3;
+            }
+        }
+        return;
+    }
+
+    method void run() {
+        do Output.printString("Presiona cualquier tecla para iniciar...");
+        do seedFromWait();
+        do Screen.clearScreen();
+
+        do drawCenter();
+        do drawScoreLabel();
+        while ((alive = 1) & (score < 15)) {
+            do drawPlanetAt(angle, false); // borra el planeta en su posición ACTUAL, antes de moverlo
+
+            let key = Keyboard.keyPressed();
+            if (key = 130) { let angle = angle - 1; }   // flecha izquierda
+            if (key = 132) { let angle = angle + 1; }   // flecha derecha
+            if (angle < 0) { let angle = numSteps - 1; }
+            if (angle > (numSteps - 1)) { let angle = 0; }
+
+            let frameCount = frameCount + 1;
+            // En vez de aparecer cada "spawnEvery" frames exactos (predecible),
+            // cada frame hay 1-en-"spawnEvery" probabilidad de que aparezca uno nuevo.
+            // Mismo ritmo promedio, pero el momento exacto nunca se sabe.
+            if (nextRandom(spawnEvery) = 0) {
+                do spawnObject();
+            }
+            if (nextRandom(particleSpawnChance) = 0) {
+                do spawnParticle();
+            }
+            do increaseDifficulty();
+
+            do updateRings();
+            do updateObjects();
+            do updateParticles();
+            do drawPlanetAt(angle, true); // dibuja el planeta en su posición NUEVA
+            do drawScore();
+
+            do Sys.wait(50);
+        }
+
+        if (alive = 1) {
+            do Output.printString("¡GANASTE!");
+        } else {
+            do showGameOver();
+        }
+        return;
+    }
+
+    method void dispose() {
+        do cosTable.dispose();
+        do sinTable.dispose();
+        do objAngle.dispose();
+        do objRadius.dispose();
+        do objActive.dispose();
+        do objSpeed.dispose();
+        do ringRadius.dispose();
+        do particleAngle.dispose();
+        do particleRadius.dispose();
+        do particleActive.dispose();
+        do particleSpeed.dispose();
+        do particleTimer.dispose();
+        do Memory.deAlloc(this);
+        return;
+    }
+
+    function void main() {
+        var Main game;
+        let game = Main.new();
+        do game.run();
+        do game.dispose();
+        return;
+    }
+}
